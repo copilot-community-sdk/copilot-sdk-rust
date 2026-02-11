@@ -204,6 +204,29 @@ impl PermissionRequestResult {
             rules: None,
         }
     }
+
+    /// Create a denied permission result with a human-readable reason.
+    ///
+    /// The reason is included in the rules so the CLI/LLM can understand
+    /// why the request was denied and adapt its approach.
+    pub fn denied_with_reason(reason: impl Into<String>) -> Self {
+        Self {
+            kind: "denied-no-approval-rule-and-could-not-request-from-user".to_string(),
+            rules: Some(vec![serde_json::json!({
+                "reason": reason.into()
+            })]),
+        }
+    }
+
+    /// Returns true if the permission was approved.
+    pub fn is_approved(&self) -> bool {
+        self.kind == "approved"
+    }
+
+    /// Returns true if the permission was denied.
+    pub fn is_denied(&self) -> bool {
+        self.kind.starts_with("denied")
+    }
 }
 
 // =============================================================================
@@ -583,6 +606,24 @@ pub struct SessionConfig {
     /// Default: false (explicit configuration preferred over environment variables)
     #[serde(skip)]
     pub auto_byok_from_env: bool,
+
+    /// Command patterns to automatically deny in permission requests.
+    ///
+    /// Each pattern is checked against the `fullCommandText` field in permission
+    /// requests. If any pattern matches (case-insensitive whole-word), the request
+    /// is automatically denied before reaching the user's permission handler.
+    ///
+    /// Example patterns:
+    /// - `"git push"` — deny any command containing "git push"
+    /// - `"git commit"` — deny any command containing "git commit"
+    /// - `"rm -rf"` — deny recursive force removal
+    ///
+    /// This is a safety net that works in addition to `deny_tools` on `ClientOptions`.
+    /// While `deny_tools` prevents the CLI from even attempting the tool call,
+    /// `denied_command_patterns` catches anything that slips through at the
+    /// permission handler level.
+    #[serde(skip)]
+    pub denied_command_patterns: Option<Vec<String>>,
 }
 
 /// Configuration for resuming an existing session.
@@ -611,6 +652,12 @@ pub struct ResumeSessionConfig {
     /// Default: false (explicit configuration preferred over environment variables)
     #[serde(skip)]
     pub auto_byok_from_env: bool,
+
+    /// Command patterns to automatically deny in permission requests.
+    ///
+    /// See [`SessionConfig::denied_command_patterns`] for details.
+    #[serde(skip)]
+    pub denied_command_patterns: Option<Vec<String>>,
 }
 
 /// Options for sending a message.
@@ -661,6 +708,31 @@ pub struct ClientOptions {
     pub auto_start: bool,
     pub auto_restart: bool,
     pub environment: Option<HashMap<String, String>>,
+
+    /// Tool specifications to deny (passed as `--deny-tool` arguments to the CLI).
+    ///
+    /// Each entry follows the CLI's tool specification format:
+    /// - `"shell(git push)"` — deny a specific shell command
+    /// - `"shell(git)"` — deny all git commands
+    /// - `"shell(rm)"` — deny rm commands
+    /// - `"shell"` — deny all shell commands
+    /// - `"write"` — deny file write operations
+    /// - `"MCP_SERVER(tool_name)"` — deny a specific MCP tool
+    ///
+    /// `--deny-tool` takes precedence over `--allow-tool` and `--allow-all-tools`.
+    pub deny_tools: Option<Vec<String>>,
+
+    /// Tool specifications to allow without manual approval
+    /// (passed as `--allow-tool` arguments to the CLI).
+    ///
+    /// Each entry follows the same format as `deny_tools`.
+    pub allow_tools: Option<Vec<String>>,
+
+    /// If true, passes `--allow-all-tools` to the CLI.
+    ///
+    /// This allows Copilot to use any tool without asking for approval.
+    /// Use `deny_tools` in combination to create an allowlist with exceptions.
+    pub allow_all_tools: bool,
 }
 
 impl Default for ClientOptions {
@@ -676,6 +748,9 @@ impl Default for ClientOptions {
             auto_start: true,
             auto_restart: true,
             environment: None,
+            deny_tools: None,
+            allow_tools: None,
+            allow_all_tools: false,
         }
     }
 }
@@ -808,9 +883,23 @@ mod tests {
     fn test_permission_result() {
         let approved = PermissionRequestResult::approved();
         assert_eq!(approved.kind, "approved");
+        assert!(approved.is_approved());
+        assert!(!approved.is_denied());
 
         let denied = PermissionRequestResult::denied();
         assert!(denied.kind.starts_with("denied"));
+        assert!(denied.is_denied());
+        assert!(!denied.is_approved());
+    }
+
+    #[test]
+    fn test_permission_result_denied_with_reason() {
+        let result = PermissionRequestResult::denied_with_reason("git push is not allowed");
+        assert!(result.is_denied());
+        assert!(result.rules.is_some());
+        let rules = result.rules.unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0]["reason"], "git push is not allowed");
     }
 
     #[test]

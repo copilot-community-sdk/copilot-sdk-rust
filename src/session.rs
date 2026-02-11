@@ -80,6 +80,8 @@ struct SessionState {
     event_handlers: HashMap<u64, EventHandler>,
     /// Next handler ID.
     next_handler_id: AtomicU64,
+    /// Command patterns to automatically deny in permission requests.
+    denied_command_patterns: Vec<String>,
 }
 
 /// A Copilot conversation session.
@@ -147,6 +149,7 @@ impl Session {
                 permission_handler: None,
                 event_handlers: HashMap::new(),
                 next_handler_id: AtomicU64::new(1),
+                denied_command_patterns: Vec::new(),
             })),
             invoke_fn: Arc::new(invoke_fn),
         }
@@ -355,12 +358,158 @@ impl Session {
         state.permission_handler = Some(Arc::new(handler));
     }
 
+    /// Set command patterns to automatically deny in permission requests.
+    ///
+    /// Each pattern is checked against the `fullCommandText` field in permission
+    /// requests. If any pattern matches (case-insensitive, whole-word boundaries),
+    /// the request is automatically denied before reaching the user's permission handler.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use copilot_sdk::{Client, SessionConfig};
+    /// # async fn example() -> copilot_sdk::Result<()> {
+    /// # let client = Client::builder().build()?;
+    /// # let session = client.create_session(SessionConfig::default()).await?;
+    /// session.set_denied_command_patterns(vec![
+    ///     "git push".to_string(),
+    ///     "git commit".to_string(),
+    ///     "git add".to_string(),
+    ///     "rm -rf".to_string(),
+    /// ]).await;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn set_denied_command_patterns(&self, patterns: Vec<String>) {
+        let mut state = self.state.write().await;
+        state.denied_command_patterns = patterns;
+    }
+
+    /// Check if a command text matches any denied command pattern.
+    ///
+    /// For multi-word patterns (e.g., `"git push"`), checks that ALL words
+    /// appear as whole words in the text. This handles CLI evasion tricks like
+    /// `git -c commit.gpgsign=false commit` matching `"git commit"`.
+    ///
+    /// Uses case-insensitive matching with word boundary checks.
+    fn matches_denied_pattern(text: &str, patterns: &[String]) -> Option<String> {
+        let text_lower = text.to_lowercase();
+        let text_bytes = text_lower.as_bytes();
+
+        'pattern: for pattern in patterns {
+            let pattern_lower = pattern.to_lowercase();
+            let words: Vec<&str> = pattern_lower.split_whitespace().collect();
+
+            if words.is_empty() {
+                continue;
+            }
+
+            // Every word in the pattern must appear as a whole word in the text
+            for word in &words {
+                if !Self::contains_whole_word(text_bytes, &text_lower, word) {
+                    continue 'pattern;
+                }
+            }
+
+            return Some(pattern.clone());
+        }
+
+        None
+    }
+
+    /// Check if `text` contains `word` as a whole word (word boundary on both sides).
+    fn contains_whole_word(text_bytes: &[u8], text_lower: &str, word: &str) -> bool {
+        let word_len = word.len();
+        let mut start = 0;
+
+        while let Some(pos) = text_lower[start..].find(word) {
+            let abs_pos = start + pos;
+
+            // Check word boundary before
+            let before_ok = abs_pos == 0 || {
+                let b = text_bytes[abs_pos - 1];
+                !b.is_ascii_alphanumeric() && b != b'_'
+            };
+
+            // Check word boundary after
+            let end = abs_pos + word_len;
+            let after_ok = end >= text_bytes.len() || {
+                let b = text_bytes[end];
+                !b.is_ascii_alphanumeric() && b != b'_'
+            };
+
+            if before_ok && after_ok {
+                return true;
+            }
+
+            // Move past this occurrence to find next
+            start = abs_pos + 1;
+            if start >= text_lower.len() {
+                break;
+            }
+        }
+
+        false
+    }
+
     /// Handle a permission request.
+    ///
+    /// First checks against `denied_command_patterns`. If a match is found,
+    /// automatically denies with a reason. Otherwise, delegates to the
+    /// registered permission handler (or denies by default if no handler is set).
     pub async fn handle_permission_request(
         &self,
         request: &PermissionRequest,
     ) -> PermissionRequestResult {
         let state = self.state.read().await;
+
+        // Check denied command patterns first
+        if !state.denied_command_patterns.is_empty() {
+            // Check fullCommandText
+            if let Some(full_cmd) = request.extension_data.get("fullCommandText") {
+                if let Some(cmd_text) = full_cmd.as_str() {
+                    if let Some(matched_pattern) =
+                        Self::matches_denied_pattern(cmd_text, &state.denied_command_patterns)
+                    {
+                        tracing::info!(
+                            pattern = %matched_pattern,
+                            command = %cmd_text,
+                            "Permission denied by denied_command_patterns"
+                        );
+                        return PermissionRequestResult::denied_with_reason(format!(
+                            "Command denied by policy: matches pattern '{}'",
+                            matched_pattern
+                        ));
+                    }
+                }
+            }
+
+            // Also check commands[].identifier
+            if let Some(commands) = request.extension_data.get("commands") {
+                if let Some(cmds_array) = commands.as_array() {
+                    for cmd in cmds_array {
+                        if let Some(identifier) = cmd.get("identifier").and_then(|v| v.as_str()) {
+                            if let Some(matched_pattern) = Self::matches_denied_pattern(
+                                identifier,
+                                &state.denied_command_patterns,
+                            ) {
+                                tracing::info!(
+                                    pattern = %matched_pattern,
+                                    identifier = %identifier,
+                                    "Permission denied by denied_command_patterns (identifier)"
+                                );
+                                return PermissionRequestResult::denied_with_reason(format!(
+                                    "Command denied by policy: matches pattern '{}'",
+                                    matched_pattern
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Delegate to user-registered permission handler
         if let Some(handler) = &state.permission_handler {
             handler(request)
         } else {
@@ -596,6 +745,190 @@ mod tests {
 
         let result = session.handle_permission_request(&request).await;
         assert_eq!(result.kind, "approved");
+    }
+
+    #[tokio::test]
+    async fn test_denied_command_patterns_fullcommandtext() {
+        let session = Session::new("test".to_string(), None, mock_invoke);
+
+        // Set denied patterns
+        session
+            .set_denied_command_patterns(vec![
+                "git push".to_string(),
+                "git commit".to_string(),
+                "git add".to_string(),
+            ])
+            .await;
+
+        // Register an approve-all handler (should NOT be reached for denied commands)
+        session
+            .register_permission_handler(|_req| PermissionRequestResult::approved())
+            .await;
+
+        // Test: git push should be denied
+        let mut ext = HashMap::new();
+        ext.insert(
+            "fullCommandText".to_string(),
+            serde_json::json!("git push origin main"),
+        );
+        let request = PermissionRequest {
+            kind: "tool_execution".to_string(),
+            tool_call_id: Some("call-1".to_string()),
+            extension_data: ext,
+        };
+        let result = session.handle_permission_request(&request).await;
+        assert!(result.is_denied());
+
+        // Test: git commit should be denied
+        let mut ext = HashMap::new();
+        ext.insert(
+            "fullCommandText".to_string(),
+            serde_json::json!("git -c commit.gpgsign=false commit -m 'test'"),
+        );
+        let request = PermissionRequest {
+            kind: "tool_execution".to_string(),
+            tool_call_id: None,
+            extension_data: ext,
+        };
+        let result = session.handle_permission_request(&request).await;
+        assert!(result.is_denied());
+
+        // Test: git add should be denied
+        let mut ext = HashMap::new();
+        ext.insert(
+            "fullCommandText".to_string(),
+            serde_json::json!("/usr/local/bin/git -C /path add ."),
+        );
+        let request = PermissionRequest {
+            kind: "tool_execution".to_string(),
+            tool_call_id: None,
+            extension_data: ext,
+        };
+        let result = session.handle_permission_request(&request).await;
+        assert!(result.is_denied());
+
+        // Test: git status should be ALLOWED (not in denied patterns)
+        let mut ext = HashMap::new();
+        ext.insert(
+            "fullCommandText".to_string(),
+            serde_json::json!("git status"),
+        );
+        let request = PermissionRequest {
+            kind: "tool_execution".to_string(),
+            tool_call_id: None,
+            extension_data: ext,
+        };
+        let result = session.handle_permission_request(&request).await;
+        assert!(result.is_approved());
+
+        // Test: ls -la should be ALLOWED
+        let mut ext = HashMap::new();
+        ext.insert(
+            "fullCommandText".to_string(),
+            serde_json::json!("ls -la"),
+        );
+        let request = PermissionRequest {
+            kind: "tool_execution".to_string(),
+            tool_call_id: None,
+            extension_data: ext,
+        };
+        let result = session.handle_permission_request(&request).await;
+        assert!(result.is_approved());
+    }
+
+    #[tokio::test]
+    async fn test_denied_command_patterns_identifier() {
+        let session = Session::new("test".to_string(), None, mock_invoke);
+
+        session
+            .set_denied_command_patterns(vec!["git push".to_string()])
+            .await;
+
+        session
+            .register_permission_handler(|_req| PermissionRequestResult::approved())
+            .await;
+
+        // Test: commands[].identifier match
+        let mut ext = HashMap::new();
+        ext.insert(
+            "commands".to_string(),
+            serde_json::json!([{"identifier": "git push"}]),
+        );
+        let request = PermissionRequest {
+            kind: "tool_execution".to_string(),
+            tool_call_id: None,
+            extension_data: ext,
+        };
+        let result = session.handle_permission_request(&request).await;
+        assert!(result.is_denied());
+    }
+
+    #[tokio::test]
+    async fn test_denied_command_patterns_word_boundary() {
+        let session = Session::new("test".to_string(), None, mock_invoke);
+
+        session
+            .set_denied_command_patterns(vec!["rm".to_string()])
+            .await;
+
+        session
+            .register_permission_handler(|_req| PermissionRequestResult::approved())
+            .await;
+
+        // "rm -rf /" should be denied
+        let mut ext = HashMap::new();
+        ext.insert(
+            "fullCommandText".to_string(),
+            serde_json::json!("rm -rf /"),
+        );
+        let request = PermissionRequest {
+            kind: "tool_execution".to_string(),
+            tool_call_id: None,
+            extension_data: ext,
+        };
+        let result = session.handle_permission_request(&request).await;
+        assert!(result.is_denied());
+
+        // "form" should NOT be denied (rm is a substring but not a word)
+        let mut ext = HashMap::new();
+        ext.insert(
+            "fullCommandText".to_string(),
+            serde_json::json!("form submit"),
+        );
+        let request = PermissionRequest {
+            kind: "tool_execution".to_string(),
+            tool_call_id: None,
+            extension_data: ext,
+        };
+        let result = session.handle_permission_request(&request).await;
+        assert!(result.is_approved());
+    }
+
+    #[test]
+    fn test_matches_denied_pattern() {
+        // Basic match
+        assert!(Session::matches_denied_pattern("git push origin", &["git push".to_string()]).is_some());
+
+        // Case insensitive
+        assert!(Session::matches_denied_pattern("GIT PUSH", &["git push".to_string()]).is_some());
+
+        // No match
+        assert!(Session::matches_denied_pattern("git status", &["git push".to_string()]).is_none());
+
+        // Word boundary: "rm" should not match "form"
+        assert!(Session::matches_denied_pattern("form submit", &["rm".to_string()]).is_none());
+
+        // Word boundary: "rm" should match "rm -rf"
+        assert!(Session::matches_denied_pattern("rm -rf /", &["rm".to_string()]).is_some());
+
+        // Match at end of string
+        assert!(Session::matches_denied_pattern("git add", &["git add".to_string()]).is_some());
+
+        // Match with path prefix
+        assert!(Session::matches_denied_pattern(
+            "/usr/local/bin/git -C /tmp add .",
+            &["git".to_string(), "add".to_string()]
+        ).is_some());
     }
 
     #[tokio::test]

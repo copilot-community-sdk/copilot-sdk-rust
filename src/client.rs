@@ -599,6 +599,9 @@ impl Client {
             config.provider = ProviderConfig::from_env();
         }
 
+        // Extract denied_command_patterns before serialization (it's #[serde(skip)])
+        let denied_patterns = config.denied_command_patterns.take().unwrap_or_default();
+
         // Build the request
         let params = serde_json::to_value(&config)?;
 
@@ -623,6 +626,11 @@ impl Client {
             .create_session_object(session_id.clone(), workspace_path)
             .await;
 
+        // Apply denied command patterns to the session
+        if !denied_patterns.is_empty() {
+            session.set_denied_command_patterns(denied_patterns).await;
+        }
+
         // Store session
         self.sessions
             .write()
@@ -644,6 +652,9 @@ impl Client {
         if config.auto_byok_from_env && config.provider.is_none() {
             config.provider = ProviderConfig::from_env();
         }
+
+        // Extract denied_command_patterns before serialization (it's #[serde(skip)])
+        let denied_patterns = config.denied_command_patterns.take().unwrap_or_default();
 
         // Build the request
         let mut params = serde_json::to_value(&config)?;
@@ -669,6 +680,11 @@ impl Client {
         let session = self
             .create_session_object(resumed_id.clone(), workspace_path)
             .await;
+
+        // Apply denied command patterns to the session
+        if !denied_patterns.is_empty() {
+            session.set_denied_command_patterns(denied_patterns).await;
+        }
 
         // Store session
         self.sessions
@@ -898,6 +914,28 @@ impl Client {
         if let Some(extra_args) = &self.options.cli_args {
             args.extend(extra_args.iter().cloned());
         }
+
+        // Add deny-tool arguments
+        if let Some(deny_tools) = &self.options.deny_tools {
+            for tool_spec in deny_tools {
+                args.push("--deny-tool".to_string());
+                args.push(tool_spec.clone());
+            }
+        }
+
+        // Add allow-tool arguments
+        if let Some(allow_tools) = &self.options.allow_tools {
+            for tool_spec in allow_tools {
+                args.push("--allow-tool".to_string());
+                args.push(tool_spec.clone());
+            }
+        }
+
+        // Add allow-all-tools flag
+        if self.options.allow_all_tools {
+            args.push("--allow-all-tools".to_string());
+        }
+
         args.extend(["--server".to_string(), "--log-level".to_string(), log_level]);
 
         if self.options.use_stdio {
@@ -1171,6 +1209,89 @@ impl ClientBuilder {
         self
     }
 
+    /// Add a single tool specification to deny.
+    ///
+    /// Passed as `--deny-tool` to the CLI. Takes precedence over allow options.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use copilot_sdk::Client;
+    ///
+    /// let client = Client::builder()
+    ///     .deny_tool("shell(git push)")
+    ///     .deny_tool("shell(git commit)")
+    ///     .deny_tool("shell(rm)")
+    ///     .build()?;
+    /// # Ok::<(), copilot_sdk::CopilotError>(())
+    /// ```
+    pub fn deny_tool(mut self, tool_spec: impl Into<String>) -> Self {
+        self.options
+            .deny_tools
+            .get_or_insert_with(Vec::new)
+            .push(tool_spec.into());
+        self
+    }
+
+    /// Set multiple tool specifications to deny.
+    ///
+    /// Passed as `--deny-tool` arguments to the CLI.
+    pub fn deny_tools<I, S>(mut self, tool_specs: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.options.deny_tools = Some(tool_specs.into_iter().map(Into::into).collect());
+        self
+    }
+
+    /// Add a single tool specification to allow without manual approval.
+    ///
+    /// Passed as `--allow-tool` to the CLI.
+    pub fn allow_tool(mut self, tool_spec: impl Into<String>) -> Self {
+        self.options
+            .allow_tools
+            .get_or_insert_with(Vec::new)
+            .push(tool_spec.into());
+        self
+    }
+
+    /// Set multiple tool specifications to allow without manual approval.
+    ///
+    /// Passed as `--allow-tool` arguments to the CLI.
+    pub fn allow_tools<I, S>(mut self, tool_specs: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.options.allow_tools = Some(tool_specs.into_iter().map(Into::into).collect());
+        self
+    }
+
+    /// Allow all tools without manual approval.
+    ///
+    /// Passes `--allow-all-tools` to the CLI. Use with `deny_tool()` to create
+    /// an allowlist with specific exceptions.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use copilot_sdk::Client;
+    ///
+    /// // Allow everything except dangerous git operations and rm
+    /// let client = Client::builder()
+    ///     .allow_all_tools(true)
+    ///     .deny_tool("shell(git push)")
+    ///     .deny_tool("shell(git commit)")
+    ///     .deny_tool("shell(rm)")
+    ///     .build()?;
+    /// # Ok::<(), copilot_sdk::CopilotError>(())
+    /// ```
+    pub fn allow_all_tools(mut self, allow: bool) -> Self {
+        self.options.allow_all_tools = allow;
+        self
+    }
+
     /// Build the client.
     pub fn build(self) -> Result<Client> {
         Client::new(self.options)
@@ -1193,6 +1314,48 @@ mod tests {
             .build();
 
         assert!(client.is_ok());
+    }
+
+    #[test]
+    fn test_client_builder_deny_allow_tools() {
+        let client = Client::builder()
+            .allow_all_tools(true)
+            .deny_tool("shell(git push)")
+            .deny_tool("shell(git commit)")
+            .deny_tool("shell(rm)")
+            .allow_tool("shell(ls)")
+            .build()
+            .unwrap();
+
+        assert!(client.options.allow_all_tools);
+        assert_eq!(
+            client.options.deny_tools,
+            Some(vec![
+                "shell(git push)".to_string(),
+                "shell(git commit)".to_string(),
+                "shell(rm)".to_string(),
+            ])
+        );
+        assert_eq!(
+            client.options.allow_tools,
+            Some(vec!["shell(ls)".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_client_builder_deny_tools_batch() {
+        let client = Client::builder()
+            .deny_tools(vec!["shell(git push)", "shell(git add)"])
+            .build()
+            .unwrap();
+
+        assert_eq!(
+            client.options.deny_tools,
+            Some(vec![
+                "shell(git push)".to_string(),
+                "shell(git add)".to_string(),
+            ])
+        );
     }
 
     #[test]
