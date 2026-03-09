@@ -14,7 +14,7 @@ use crate::types::{
     ClientOptions, ConnectionState, GetAuthStatusResponse, GetForegroundSessionResponse,
     GetStatusResponse, LogLevel, ModelInfo, PingResponse, ProviderConfig, ResumeSessionConfig,
     SessionConfig, SessionLifecycleEvent, SessionMetadata, SetForegroundSessionResponse, StopError,
-    SDK_PROTOCOL_VERSION,
+    MIN_PROTOCOL_VERSION, SDK_PROTOCOL_VERSION,
 };
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -520,6 +520,7 @@ pub struct Client {
     lifecycle_handlers: Arc<RwLock<HashMap<u64, LifecycleHandler>>>,
     next_lifecycle_handler_id: AtomicU64,
     models_cache: Arc<Mutex<Option<Vec<ModelInfo>>>>,
+    negotiated_protocol_version: Arc<Mutex<Option<u32>>>,
 }
 
 impl Client {
@@ -571,6 +572,7 @@ impl Client {
             lifecycle_handlers: Arc::new(RwLock::new(HashMap::new())),
             next_lifecycle_handler_id: AtomicU64::new(1),
             models_cache: Arc::new(Mutex::new(None)),
+            negotiated_protocol_version: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -1196,7 +1198,8 @@ impl Client {
         Ok(())
     }
 
-    /// Verify protocol version matches.
+    /// Verify that the server's protocol version is within the supported range
+    /// and store the negotiated version.
     async fn verify_protocol_version(&self) -> Result<()> {
         // NOTE: We call the underlying RPC directly instead of ping() because ping() calls
         // ensure_connected(), but we haven't set state to Connected yet.
@@ -1206,21 +1209,37 @@ impl Client {
             .invoke("ping", Some(serde_json::json!({ "message": null })))
             .await?;
 
-        let protocol_version = result
+        let server_version = result
             .get("protocolVersion")
             .and_then(|v| v.as_u64())
             .map(|v| v as u32);
 
-        if let Some(version) = protocol_version {
-            if version != SDK_PROTOCOL_VERSION {
+        match server_version {
+            None => {
                 return Err(CopilotError::ProtocolMismatch {
-                    expected: SDK_PROTOCOL_VERSION,
+                    min: MIN_PROTOCOL_VERSION,
+                    max: SDK_PROTOCOL_VERSION,
+                    actual: 0,
+                });
+            }
+            Some(version) if version < MIN_PROTOCOL_VERSION || version > SDK_PROTOCOL_VERSION => {
+                return Err(CopilotError::ProtocolMismatch {
+                    min: MIN_PROTOCOL_VERSION,
+                    max: SDK_PROTOCOL_VERSION,
                     actual: version,
                 });
+            }
+            Some(version) => {
+                *self.negotiated_protocol_version.lock().await = Some(version);
             }
         }
 
         Ok(())
+    }
+
+    /// Get the negotiated protocol version (set after successful start).
+    pub async fn negotiated_protocol_version(&self) -> Option<u32> {
+        *self.negotiated_protocol_version.lock().await
     }
 
     /// Set up notification and request handlers.
@@ -1269,7 +1288,10 @@ impl Client {
         // Clone Arc references for request handler
         let sessions_for_requests = Arc::clone(&self.sessions);
 
-        // Set up request handler for tool.call and permission.request
+        // Protocol v2 backward-compatibility adapters.
+        // v2 servers send tool.call / permission.request as RPC requests.
+        // v3 servers send them as broadcast session events (handled in Session::handle_broadcast_event).
+        // We always register v2 handlers; a v3 server will simply never send these requests.
         rpc.set_request_handler(move |method, params| {
             use crate::jsonrpc::JsonRpcError;
 
@@ -1677,3 +1699,4 @@ mod tests {
         assert_eq!(normalize_tool_arguments(&params), json!({}));
     }
 }
+
