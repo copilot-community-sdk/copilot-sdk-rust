@@ -544,7 +544,7 @@ impl Serialize for Tool {
         let mut state = serializer.serialize_struct("Tool", 3)?;
         state.serialize_field("name", &self.name)?;
         state.serialize_field("description", &self.description)?;
-        state.serialize_field("parametersSchema", &self.parameters_schema)?;
+        state.serialize_field("parameters", &self.parameters_schema)?;
         state.end()
     }
 }
