@@ -224,8 +224,15 @@ impl Session {
 
     /// Dispatch an event to all subscribers.
     ///
+    /// Broadcast request events (external_tool.requested, permission.requested) are handled
+    /// internally before being forwarded to user handlers (protocol v3 model).
+    ///
     /// This is called by the Client when events are received.
     pub async fn dispatch_event(&self, event: SessionEvent) {
+        // Handle broadcast request events (protocol v3) before dispatching to user handlers.
+        // Fire-and-forget: the response is sent asynchronously via RPC.
+        self.handle_broadcast_event(&event).await;
+
         // Send to broadcast channel
         let _ = self.event_tx.send(event.clone());
 
@@ -233,6 +240,131 @@ impl Session {
         let state = self.state.read().await;
         for handler in state.event_handlers.values() {
             handler(&event);
+        }
+    }
+
+    /// Handle broadcast request events by executing local handlers and responding via RPC.
+    ///
+    /// Implements the protocol v3 broadcast model where tool calls and permission requests
+    /// are broadcast as session events to all clients.
+    async fn handle_broadcast_event(&self, event: &SessionEvent) {
+        match &event.data {
+            SessionEventData::ExternalToolRequested(data) => {
+                let request_id = match &data.request_id {
+                    Some(id) => id.clone(),
+                    None => return,
+                };
+                let tool_name = match &data.tool_name {
+                    Some(name) => name.clone(),
+                    None => return,
+                };
+
+                // Check if this session handles this tool
+                if self.get_tool(&tool_name).await.is_none() {
+                    return; // This client doesn't handle this tool; another client will.
+                }
+
+                let _tool_call_id = data.tool_call_id.clone().unwrap_or_default();
+                let arguments = data.arguments.clone().unwrap_or(serde_json::json!({}));
+                let session_id = self.session_id.clone();
+
+                // Execute tool and respond via handlePendingToolCall RPC
+                match self.invoke_tool(&tool_name, &arguments).await {
+                    Ok(result) => {
+                        // If the tool reported a failure with an error, send via top-level error
+                        let params = if result.result_type == "failure" || result.result_type == "error" {
+                            serde_json::json!({
+                                "sessionId": session_id,
+                                "requestId": request_id,
+                                "error": result.error.unwrap_or_else(|| result.text_result_for_llm.clone()),
+                            })
+                        } else {
+                            serde_json::json!({
+                                "sessionId": session_id,
+                                "requestId": request_id,
+                                "result": {
+                                    "textResultForLlm": result.text_result_for_llm,
+                                    "resultType": result.result_type,
+                                    "toolTelemetry": result.tool_telemetry.unwrap_or_default(),
+                                }
+                            })
+                        };
+                        let _ = (self.invoke_fn)(
+                            "session.tools.handlePendingToolCall",
+                            Some(params),
+                        ).await;
+                    }
+                    Err(e) => {
+                        let params = serde_json::json!({
+                            "sessionId": session_id,
+                            "requestId": request_id,
+                            "error": e.to_string(),
+                        });
+                        let _ = (self.invoke_fn)(
+                            "session.tools.handlePendingToolCall",
+                            Some(params),
+                        ).await;
+                    }
+                }
+            }
+            SessionEventData::PermissionRequested(data) => {
+                let request_id = match &data.request_id {
+                    Some(id) => id.clone(),
+                    None => return,
+                };
+                let perm_data = match &data.permission_request {
+                    Some(d) => d.clone(),
+                    None => return,
+                };
+
+                let session_id = self.session_id.clone();
+
+                // Build PermissionRequest from JSON
+                use crate::types::PermissionRequest;
+                let kind = perm_data
+                    .get("kind")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                let tool_call_id = perm_data
+                    .get("toolCallId")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                let mut extension_data = std::collections::HashMap::new();
+                if let Some(obj) = perm_data.as_object() {
+                    for (key, value) in obj {
+                        if key != "kind" && key != "toolCallId" {
+                            extension_data.insert(key.clone(), value.clone());
+                        }
+                    }
+                }
+
+                let request = PermissionRequest {
+                    kind,
+                    tool_call_id,
+                    extension_data,
+                };
+
+                let result = self.handle_permission_request(&request).await;
+
+                let mut perm_result_inner = serde_json::json!({
+                    "kind": result.kind,
+                });
+                if let Some(rules) = &result.rules {
+                    perm_result_inner["rules"] = serde_json::json!(rules);
+                }
+                let perm_result = serde_json::json!({
+                    "sessionId": session_id,
+                    "requestId": request_id,
+                    "result": perm_result_inner,
+                });
+
+                let _ = (self.invoke_fn)(
+                    "session.permissions.handlePendingPermissionRequest",
+                    Some(perm_result),
+                ).await;
+            }
+            _ => {} // Not a broadcast request event
         }
     }
 
