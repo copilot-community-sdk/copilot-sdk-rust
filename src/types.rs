@@ -1356,6 +1356,18 @@ mod tests {
     }
 
     #[test]
+    fn test_tool_serializes_parameters_field() {
+        let tool = Tool::new("my_tool")
+            .description("A test tool")
+            .schema(serde_json::json!({"type": "object"}));
+
+        let value = serde_json::to_value(&tool).unwrap();
+
+        assert_eq!(value["parameters"]["type"], "object");
+        assert!(value.get("parametersSchema").is_none());
+    }
+
+    #[test]
     fn test_user_input_request_roundtrip() {
         let req = UserInputRequest {
             question: "What color?".into(),

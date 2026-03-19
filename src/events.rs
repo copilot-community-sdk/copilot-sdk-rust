@@ -952,6 +952,67 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_external_tool_requested() {
+        let json = json!({
+            "id": "evt_125b",
+            "timestamp": "2024-01-15T10:30:02Z",
+            "type": "external_tool.requested",
+            "data": {
+                "requestId": "req_123",
+                "toolName": "echo",
+                "toolCallId": "call_456",
+                "arguments": {
+                    "text": "hello"
+                }
+            }
+        });
+
+        let event = SessionEvent::from_json(&json).unwrap();
+        match &event.data {
+            SessionEventData::ExternalToolRequested(data) => {
+                assert_eq!(data.request_id.as_deref(), Some("req_123"));
+                assert_eq!(data.tool_name.as_deref(), Some("echo"));
+                assert_eq!(data.tool_call_id.as_deref(), Some("call_456"));
+                assert_eq!(data.arguments.as_ref().unwrap()["text"], "hello");
+            }
+            other => panic!("Expected ExternalToolRequested, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_permission_requested() {
+        let json = json!({
+            "id": "evt_125c",
+            "timestamp": "2024-01-15T10:30:02Z",
+            "type": "permission.requested",
+            "data": {
+                "requestId": "req_789",
+                "permissionRequest": {
+                    "kind": "tool_execution",
+                    "toolCallId": "call_456",
+                    "toolName": "shell"
+                }
+            }
+        });
+
+        let event = SessionEvent::from_json(&json).unwrap();
+        match &event.data {
+            SessionEventData::PermissionRequested(data) => {
+                assert_eq!(data.request_id.as_deref(), Some("req_789"));
+                assert_eq!(
+                    data.permission_request.as_ref().unwrap()["kind"],
+                    "tool_execution"
+                );
+                assert_eq!(
+                    data.permission_request.as_ref().unwrap()["toolName"],
+                    "shell"
+                );
+            }
+            other => panic!("Expected PermissionRequested, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_parse_session_error() {
         let json = json!({
             "id": "evt_126",

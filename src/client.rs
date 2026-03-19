@@ -1222,7 +1222,7 @@ impl Client {
                     actual: 0,
                 });
             }
-            Some(version) if version < MIN_PROTOCOL_VERSION || version > SDK_PROTOCOL_VERSION => {
+            Some(version) if !(MIN_PROTOCOL_VERSION..=SDK_PROTOCOL_VERSION).contains(&version) => {
                 return Err(CopilotError::ProtocolMismatch {
                     min: MIN_PROTOCOL_VERSION,
                     max: SDK_PROTOCOL_VERSION,

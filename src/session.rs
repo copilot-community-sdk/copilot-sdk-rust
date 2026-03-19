@@ -272,7 +272,9 @@ impl Session {
                 match self.invoke_tool(&tool_name, &arguments).await {
                     Ok(result) => {
                         // If the tool reported a failure with an error, send via top-level error
-                        let params = if result.result_type == "failure" || result.result_type == "error" {
+                        let params = if result.result_type == "failure"
+                            || result.result_type == "error"
+                        {
                             serde_json::json!({
                                 "sessionId": session_id,
                                 "requestId": request_id,
@@ -289,10 +291,9 @@ impl Session {
                                 }
                             })
                         };
-                        let _ = (self.invoke_fn)(
-                            "session.tools.handlePendingToolCall",
-                            Some(params),
-                        ).await;
+                        let _ =
+                            (self.invoke_fn)("session.tools.handlePendingToolCall", Some(params))
+                                .await;
                     }
                     Err(e) => {
                         let params = serde_json::json!({
@@ -300,10 +301,9 @@ impl Session {
                             "requestId": request_id,
                             "error": e.to_string(),
                         });
-                        let _ = (self.invoke_fn)(
-                            "session.tools.handlePendingToolCall",
-                            Some(params),
-                        ).await;
+                        let _ =
+                            (self.invoke_fn)("session.tools.handlePendingToolCall", Some(params))
+                                .await;
                     }
                 }
             }
@@ -362,7 +362,8 @@ impl Session {
                 let _ = (self.invoke_fn)(
                     "session.permissions.handlePendingPermissionRequest",
                     Some(perm_result),
-                ).await;
+                )
+                .await;
             }
             _ => {} // Not a broadcast request event
         }
@@ -971,6 +972,125 @@ mod tests {
 
         let result = session.handle_permission_request(&request).await;
         assert_eq!(result.kind, "approved");
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_event_handles_external_tool_requested() {
+        let rpc_calls = Arc::new(std::sync::Mutex::new(Vec::<(String, Value)>::new()));
+        let rpc_calls_for_invoke = Arc::clone(&rpc_calls);
+        let session = Session::new("test".to_string(), None, move |method, params| {
+            let method = method.to_string();
+            let params = params.unwrap_or(Value::Null);
+            let rpc_calls = Arc::clone(&rpc_calls_for_invoke);
+            Box::pin(async move {
+                rpc_calls.lock().unwrap().push((method, params));
+                Ok(serde_json::json!({}))
+            })
+        });
+
+        session
+            .register_tool_with_handler(
+                Tool::new("echo").description("Echo tool"),
+                Some(Arc::new(|_name, args| {
+                    ToolResultObject::text(
+                        args.get("text")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("missing"),
+                    )
+                })),
+            )
+            .await;
+
+        let mut subscription = session.subscribe();
+        let event = SessionEvent::from_json(&serde_json::json!({
+            "id": "evt-broadcast-tool",
+            "timestamp": "2024-01-01T00:00:00Z",
+            "type": "external_tool.requested",
+            "data": {
+                "requestId": "req-tool-1",
+                "toolName": "echo",
+                "toolCallId": "call-tool-1",
+                "arguments": {
+                    "text": "hello"
+                }
+            }
+        }))
+        .unwrap();
+
+        session.dispatch_event(event).await;
+
+        let forwarded = subscription.recv().await.unwrap();
+        assert_eq!(forwarded.event_type, "external_tool.requested");
+
+        let calls = rpc_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "session.tools.handlePendingToolCall");
+        assert_eq!(calls[0].1["sessionId"], "test");
+        assert_eq!(calls[0].1["requestId"], "req-tool-1");
+        assert_eq!(calls[0].1["result"]["textResultForLlm"], "hello");
+        assert_eq!(calls[0].1["result"]["resultType"], "success");
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_event_handles_permission_requested() {
+        let rpc_calls = Arc::new(std::sync::Mutex::new(Vec::<(String, Value)>::new()));
+        let rpc_calls_for_invoke = Arc::clone(&rpc_calls);
+        let seen_request = Arc::new(std::sync::Mutex::new(None::<PermissionRequest>));
+        let seen_request_for_handler = Arc::clone(&seen_request);
+        let session = Session::new("test".to_string(), None, move |method, params| {
+            let method = method.to_string();
+            let params = params.unwrap_or(Value::Null);
+            let rpc_calls = Arc::clone(&rpc_calls_for_invoke);
+            Box::pin(async move {
+                rpc_calls.lock().unwrap().push((method, params));
+                Ok(serde_json::json!({}))
+            })
+        });
+
+        session
+            .register_permission_handler(move |request| {
+                *seen_request_for_handler.lock().unwrap() = Some(request.clone());
+                PermissionRequestResult::approved()
+            })
+            .await;
+
+        let mut subscription = session.subscribe();
+        let event = SessionEvent::from_json(&serde_json::json!({
+            "id": "evt-broadcast-permission",
+            "timestamp": "2024-01-01T00:00:00Z",
+            "type": "permission.requested",
+            "data": {
+                "requestId": "req-perm-1",
+                "permissionRequest": {
+                    "kind": "tool_execution",
+                    "toolCallId": "call-perm-1",
+                    "toolName": "shell",
+                    "command": "ls"
+                }
+            }
+        }))
+        .unwrap();
+
+        session.dispatch_event(event).await;
+
+        let forwarded = subscription.recv().await.unwrap();
+        assert_eq!(forwarded.event_type, "permission.requested");
+
+        let request = seen_request.lock().unwrap().clone().unwrap();
+        assert_eq!(request.kind, "tool_execution");
+        assert_eq!(request.tool_call_id.as_deref(), Some("call-perm-1"));
+        assert_eq!(request.extension_data["toolName"], "shell");
+        assert_eq!(request.extension_data["command"], "ls");
+
+        let calls = rpc_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].0,
+            "session.permissions.handlePendingPermissionRequest"
+        );
+        assert_eq!(calls[0].1["sessionId"], "test");
+        assert_eq!(calls[0].1["requestId"], "req-perm-1");
+        assert_eq!(calls[0].1["result"]["kind"], "approved");
     }
 
     #[tokio::test]
