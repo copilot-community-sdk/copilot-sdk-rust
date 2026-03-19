@@ -12,8 +12,9 @@ use crate::process::{CopilotProcess, ProcessOptions};
 use crate::session::Session;
 use crate::types::{
     ClientOptions, ConnectionState, GetAuthStatusResponse, GetForegroundSessionResponse,
-    GetStatusResponse, LogLevel, ModelInfo, PingResponse, ProviderConfig, ResumeSessionConfig,
-    SessionConfig, SessionLifecycleEvent, SessionMetadata, SetForegroundSessionResponse, StopError,
+    GetStatusResponse, LogLevel, ModelInfo, PingResponse, ProviderConfig, QuotaResult,
+    ResumeSessionConfig, SessionConfig, SessionLifecycleEvent, SessionMetadata,
+    SetForegroundSessionResponse, StopError, TelemetryConfig, ToolsListResult,
     MIN_PROTOCOL_VERSION, SDK_PROTOCOL_VERSION,
 };
 use serde_json::{json, Value};
@@ -901,6 +902,9 @@ impl Client {
     ///
     /// Results are cached after the first call. Use [`clear_models_cache`] to force a refresh.
     ///
+    /// If `on_list_models` was set via the builder, that callback is used instead of
+    /// querying the CLI (useful for BYOK scenarios).
+    ///
     /// # Errors
     /// Returns an error if not authenticated or if the request fails.
     pub async fn list_models(&self) -> Result<Vec<ModelInfo>> {
@@ -910,6 +914,13 @@ impl Client {
             if let Some(cached) = &*cache {
                 return Ok(cached.clone());
             }
+        }
+
+        // Check for custom model list provider
+        if let Some(ref handler) = self.options.on_list_models {
+            let models = handler().await?;
+            *self.models_cache.lock().await = Some(models.clone());
+            return Ok(models);
         }
 
         self.ensure_connected().await?;
@@ -927,6 +938,25 @@ impl Client {
         *self.models_cache.lock().await = Some(models.clone());
 
         Ok(models)
+    }
+
+    /// List available tools with optional model-specific overrides.
+    pub async fn tools_list(&self, model_id: Option<&str>) -> Result<ToolsListResult> {
+        self.ensure_connected().await?;
+
+        let params = model_id.map(|id| json!({ "modelId": id }));
+        let result = self.invoke("tools.list", params).await?;
+        serde_json::from_value(result)
+            .map_err(|e| CopilotError::Protocol(format!("Failed to parse tools list: {}", e)))
+    }
+
+    /// Get account quota information.
+    pub async fn get_quota(&self) -> Result<QuotaResult> {
+        self.ensure_connected().await?;
+
+        let result = self.invoke("account.get_quota", None).await?;
+        serde_json::from_value(result)
+            .map_err(|e| CopilotError::Protocol(format!("Failed to parse quota result: {}", e)))
     }
 
     /// Clear the cached models list, forcing a fresh fetch on next `list_models()` call.
@@ -1164,6 +1194,31 @@ impl Client {
         // Wire use_logged_in_user: when false, pass --no-auto-login
         if let Some(false) = self.options.use_logged_in_user {
             args.push("--no-auto-login".to_string());
+        }
+
+        // Propagate telemetry configuration as environment variables
+        if let Some(ref telemetry) = self.options.telemetry {
+            if telemetry.otlp_endpoint.is_some() || telemetry.file_path.is_some() {
+                proc_options = proc_options.env("COPILOT_OTEL_ENABLED", "true");
+            }
+            if let Some(ref endpoint) = telemetry.otlp_endpoint {
+                proc_options = proc_options.env("OTEL_EXPORTER_OTLP_ENDPOINT", endpoint);
+            }
+            if let Some(ref path) = telemetry.file_path {
+                proc_options = proc_options.env("COPILOT_OTEL_FILE_EXPORTER_PATH", path);
+            }
+            if let Some(ref exporter_type) = telemetry.exporter_type {
+                proc_options = proc_options.env("COPILOT_OTEL_EXPORTER_TYPE", exporter_type);
+            }
+            if let Some(ref source_name) = telemetry.source_name {
+                proc_options = proc_options.env("COPILOT_OTEL_SOURCE_NAME", source_name);
+            }
+            if let Some(capture) = telemetry.capture_content {
+                if capture {
+                    proc_options = proc_options
+                        .env("OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT", "true");
+                }
+            }
         }
 
         let args_refs: Vec<&str> = full_args.iter().map(|s| s.as_str()).collect();
@@ -1510,6 +1565,26 @@ impl ClientBuilder {
         S: Into<String>,
     {
         self.options.allow_tools = Some(tool_specs.into_iter().map(Into::into).collect());
+        self
+    }
+
+    /// Set the telemetry configuration.
+    pub fn telemetry(mut self, config: TelemetryConfig) -> Self {
+        self.options.telemetry = Some(config);
+        self
+    }
+
+    /// Set a custom model list provider for BYOK.
+    ///
+    /// When set, `list_models()` will call this handler instead of querying the CLI.
+    pub fn on_list_models<F, Fut>(mut self, handler: F) -> Self
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = std::result::Result<Vec<ModelInfo>, CopilotError>>
+            + Send
+            + 'static,
+    {
+        self.options.on_list_models = Some(Arc::new(move || Box::pin(handler())));
         self
     }
 

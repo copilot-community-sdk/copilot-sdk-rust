@@ -121,3 +121,27 @@ path = "examples/escape_room.rs"
 [[example]]
 name = "rscopilot-cli"
 path = "examples/rscopilot_cli.rs"
+
+[[example]]
+name = "set_model"
+path = "examples/set_model.rs"
+
+[[example]]
+name = "mode_switching"
+path = "examples/mode_switching.rs"
+
+[[example]]
+name = "plan_ops"
+path = "examples/plan_ops.rs"
+
+[[example]]
+name = "agent_management"
+path = "examples/agent_management.rs"
+
+[[example]]
+name = "telemetry"
+path = "examples/telemetry.rs"
+
+[[example]]
+name = "shell_exec"
+path = "examples/shell_exec.rs"

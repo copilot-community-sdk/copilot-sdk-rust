@@ -8,10 +8,12 @@
 use crate::error::{CopilotError, Result};
 use crate::events::{SessionEvent, SessionEventData};
 use crate::types::{
-    ErrorOccurredHookInput, MessageOptions, PermissionRequest, PermissionRequestResult,
-    PostToolUseHookInput, PreToolUseHookInput, SessionEndHookInput, SessionHooks,
-    SessionStartHookInput, Tool, ToolResultObject, UserInputInvocation, UserInputRequest,
-    UserInputResponse, UserPromptSubmittedHookInput,
+    AgentInfo, ErrorOccurredHookInput, FleetStartOptions, LogOptions, LogResult, MessageOptions,
+    PermissionRequest, PermissionRequestResult, PlanData, PostToolUseHookInput,
+    PreToolUseHookInput, SessionEndHookInput, SessionHooks, SessionMode, SessionStartHookInput,
+    SetModelOptions, ShellExecOptions, ShellExecResult, ShellSignal, Tool, ToolResultObject,
+    UserInputInvocation, UserInputRequest, UserInputResponse, UserPromptSubmittedHookInput,
+    WorkspaceFile,
 };
 use serde_json::Value;
 use std::collections::HashMap;
@@ -682,6 +684,260 @@ impl Session {
         });
 
         (self.invoke_fn)("session.destroy", Some(params)).await?;
+        Ok(())
+    }
+
+    // =========================================================================
+    // Model Management
+    // =========================================================================
+
+    /// Get the current model for this session.
+    pub async fn get_model(&self) -> Result<String> {
+        let params = serde_json::json!({ "sessionId": self.session_id });
+        let result = (self.invoke_fn)("session.model.get_current", Some(params)).await?;
+        result
+            .get("modelId")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .ok_or_else(|| CopilotError::Protocol("Missing modelId in response".into()))
+    }
+
+    /// Switch to a different model mid-session.
+    pub async fn set_model(&self, model: &str, options: Option<SetModelOptions>) -> Result<()> {
+        let mut params = serde_json::json!({
+            "sessionId": self.session_id,
+            "modelId": model,
+        });
+        if let Some(opts) = options {
+            if let Some(effort) = opts.reasoning_effort {
+                params["reasoningEffort"] = serde_json::json!(effort);
+            }
+        }
+        (self.invoke_fn)("session.model.switch_to", Some(params)).await?;
+        Ok(())
+    }
+
+    // =========================================================================
+    // Mode Management
+    // =========================================================================
+
+    /// Get the current session mode.
+    pub async fn get_mode(&self) -> Result<SessionMode> {
+        let params = serde_json::json!({ "sessionId": self.session_id });
+        let result = (self.invoke_fn)("session.mode.get", Some(params)).await?;
+        let mode_str = result
+            .get("mode")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| CopilotError::Protocol("Missing mode in response".into()))?;
+        serde_json::from_value(serde_json::json!(mode_str))
+            .map_err(|e| CopilotError::Protocol(format!("Invalid mode '{}': {}", mode_str, e)))
+    }
+
+    /// Set the session mode (interactive, plan, or autopilot).
+    pub async fn set_mode(&self, mode: SessionMode) -> Result<()> {
+        let params = serde_json::json!({
+            "sessionId": self.session_id,
+            "mode": mode,
+        });
+        (self.invoke_fn)("session.mode.set", Some(params)).await?;
+        Ok(())
+    }
+
+    // =========================================================================
+    // Session Logging
+    // =========================================================================
+
+    /// Add a log entry to the session.
+    pub async fn log(&self, message: &str, options: Option<LogOptions>) -> Result<LogResult> {
+        let mut params = serde_json::json!({
+            "sessionId": self.session_id,
+            "message": message,
+        });
+        if let Some(opts) = options {
+            if let Some(level) = opts.level {
+                params["level"] = serde_json::to_value(level).unwrap_or_default();
+            }
+            if let Some(ephemeral) = opts.ephemeral {
+                params["ephemeral"] = serde_json::json!(ephemeral);
+            }
+        }
+        let result = (self.invoke_fn)("session.log", Some(params)).await?;
+        let event_id = result
+            .get("eventId")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        Ok(LogResult { event_id })
+    }
+
+    // =========================================================================
+    // Plan Management
+    // =========================================================================
+
+    /// Read the current plan.
+    pub async fn read_plan(&self) -> Result<Option<PlanData>> {
+        let params = serde_json::json!({ "sessionId": self.session_id });
+        let result = (self.invoke_fn)("session.plan.read", Some(params)).await?;
+        if result.is_null() || result.get("content").is_none() {
+            return Ok(None);
+        }
+        serde_json::from_value(result)
+            .map(Some)
+            .map_err(|e| CopilotError::Protocol(format!("Failed to parse plan: {}", e)))
+    }
+
+    /// Update the session plan.
+    pub async fn update_plan(&self, plan: &PlanData) -> Result<()> {
+        let mut params = serde_json::to_value(plan)
+            .map_err(|e| CopilotError::Protocol(format!("Failed to serialize plan: {}", e)))?;
+        params["sessionId"] = serde_json::json!(self.session_id);
+        (self.invoke_fn)("session.plan.update", Some(params)).await?;
+        Ok(())
+    }
+
+    /// Delete the session plan.
+    pub async fn delete_plan(&self) -> Result<()> {
+        let params = serde_json::json!({ "sessionId": self.session_id });
+        (self.invoke_fn)("session.plan.delete", Some(params)).await?;
+        Ok(())
+    }
+
+    // =========================================================================
+    // Agent Management
+    // =========================================================================
+
+    /// List available agents.
+    pub async fn list_agents(&self) -> Result<Vec<AgentInfo>> {
+        let params = serde_json::json!({ "sessionId": self.session_id });
+        let result = (self.invoke_fn)("session.agent.list", Some(params)).await?;
+        let agents = result
+            .get("agents")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!([]));
+        serde_json::from_value(agents)
+            .map_err(|e| CopilotError::Protocol(format!("Failed to parse agents: {}", e)))
+    }
+
+    /// Get the currently active agent.
+    pub async fn get_current_agent(&self) -> Result<Option<AgentInfo>> {
+        let params = serde_json::json!({ "sessionId": self.session_id });
+        let result = (self.invoke_fn)("session.agent.get_current", Some(params)).await?;
+        if result.is_null() || result.get("name").is_none() {
+            return Ok(None);
+        }
+        serde_json::from_value(result)
+            .map(Some)
+            .map_err(|e| CopilotError::Protocol(format!("Failed to parse agent: {}", e)))
+    }
+
+    /// Select (activate) a custom agent.
+    pub async fn select_agent(&self, name: &str) -> Result<()> {
+        let params = serde_json::json!({
+            "sessionId": self.session_id,
+            "name": name,
+        });
+        (self.invoke_fn)("session.agent.select", Some(params)).await?;
+        Ok(())
+    }
+
+    /// Deselect the current custom agent.
+    pub async fn deselect_agent(&self) -> Result<()> {
+        let params = serde_json::json!({ "sessionId": self.session_id });
+        (self.invoke_fn)("session.agent.deselect", Some(params)).await?;
+        Ok(())
+    }
+
+    // =========================================================================
+    // Compaction
+    // =========================================================================
+
+    /// Trigger manual context compaction.
+    pub async fn compact(&self) -> Result<()> {
+        let params = serde_json::json!({ "sessionId": self.session_id });
+        (self.invoke_fn)("session.compaction.compact", Some(params)).await?;
+        Ok(())
+    }
+
+    // =========================================================================
+    // Fleet Management
+    // =========================================================================
+
+    /// Start a fleet of parallel agents.
+    pub async fn start_fleet(&self, options: Option<FleetStartOptions>) -> Result<()> {
+        let mut params = serde_json::json!({ "sessionId": self.session_id });
+        if let Some(opts) = options {
+            if let Some(prompt) = opts.prompt {
+                params["prompt"] = serde_json::json!(prompt);
+            }
+        }
+        (self.invoke_fn)("session.fleet.start", Some(params)).await?;
+        Ok(())
+    }
+
+    // =========================================================================
+    // Shell Operations
+    // =========================================================================
+
+    /// Execute a shell command in the session.
+    pub async fn shell_exec(&self, options: ShellExecOptions) -> Result<ShellExecResult> {
+        let mut params = serde_json::to_value(&options).map_err(|e| {
+            CopilotError::Protocol(format!("Failed to serialize shell options: {}", e))
+        })?;
+        params["sessionId"] = serde_json::json!(self.session_id);
+        let result = (self.invoke_fn)("session.shell.exec", Some(params)).await?;
+        serde_json::from_value(result)
+            .map_err(|e| CopilotError::Protocol(format!("Failed to parse shell result: {}", e)))
+    }
+
+    /// Kill a shell process.
+    pub async fn shell_kill(&self, process_id: &str, signal: ShellSignal) -> Result<()> {
+        let params = serde_json::json!({
+            "sessionId": self.session_id,
+            "processId": process_id,
+            "signal": signal,
+        });
+        (self.invoke_fn)("session.shell.kill", Some(params)).await?;
+        Ok(())
+    }
+
+    // =========================================================================
+    // Workspace Operations
+    // =========================================================================
+
+    /// List files in the session workspace.
+    pub async fn workspace_list_files(&self) -> Result<Vec<WorkspaceFile>> {
+        let params = serde_json::json!({ "sessionId": self.session_id });
+        let result = (self.invoke_fn)("session.workspace.list_files", Some(params)).await?;
+        let files = result
+            .get("files")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!([]));
+        serde_json::from_value(files)
+            .map_err(|e| CopilotError::Protocol(format!("Failed to parse workspace files: {}", e)))
+    }
+
+    /// Read a file from the session workspace.
+    pub async fn workspace_read_file(&self, path: &str) -> Result<String> {
+        let params = serde_json::json!({
+            "sessionId": self.session_id,
+            "path": path,
+        });
+        let result = (self.invoke_fn)("session.workspace.read_file", Some(params)).await?;
+        result
+            .get("content")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .ok_or_else(|| CopilotError::Protocol("Missing content in response".into()))
+    }
+
+    /// Create a file in the session workspace.
+    pub async fn workspace_create_file(&self, path: &str, content: &str) -> Result<()> {
+        let params = serde_json::json!({
+            "sessionId": self.session_id,
+            "path": path,
+            "content": content,
+        });
+        (self.invoke_fn)("session.workspace.create_file", Some(params)).await?;
         Ok(())
     }
 }

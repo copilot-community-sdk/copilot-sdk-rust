@@ -13,9 +13,10 @@
 
 use copilot_sdk::{
     find_copilot_cli, Client, ConnectionState, CustomAgentConfig, ErrorOccurredHookOutput,
-    LogLevel, PermissionRequest, PermissionRequestResult, PreToolUseHookOutput,
-    ResumeSessionConfig, SessionConfig, SessionEventData, SessionHooks, SessionStartHookOutput,
-    SystemMessageConfig, SystemMessageMode, Tool, ToolResultObject,
+    LogLevel, LogOptions, PermissionRequest, PermissionRequestResult, PreToolUseHookOutput,
+    ResumeSessionConfig, SessionConfig, SessionEventData, SessionHooks, SessionLogLevel,
+    SessionMode, SessionStartHookOutput, SetModelOptions, SystemMessageConfig, SystemMessageMode,
+    Tool, ToolResultObject,
 };
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::Arc;
@@ -2597,4 +2598,323 @@ async fn test_permission_result_is_approved_is_denied() {
     let denied = PermissionRequestResult::denied();
     assert!(denied.is_denied());
     assert!(!denied.is_approved());
+}
+
+// =============================================================================
+// Model Management Tests
+// =============================================================================
+
+#[tokio::test]
+async fn test_get_model() {
+    skip_if_no_cli!();
+
+    let client = create_test_client().await.expect("Failed to create client");
+
+    let session = client
+        .create_session(SessionConfig {
+            model: Some("gpt-4.1".into()),
+            ..byok_session_config()
+        })
+        .await
+        .expect("Failed to create session");
+
+    let model = session.get_model().await.expect("Failed to get model");
+
+    println!("Current model: {}", model);
+    assert!(!model.is_empty(), "Model should not be empty");
+
+    client.stop().await;
+}
+
+#[tokio::test]
+async fn test_set_model() {
+    skip_if_no_cli!();
+
+    let client = create_test_client().await.expect("Failed to create client");
+
+    // Check if authenticated for model switching
+    let auth = client.get_auth_status().await.expect("Failed to get auth");
+    if !auth.is_authenticated {
+        println!("Skipping set_model test - not authenticated");
+        client.stop().await;
+        return;
+    }
+
+    let session = client
+        .create_session(byok_session_config())
+        .await
+        .expect("Failed to create session");
+
+    // Switch model (use a model likely to be available)
+    let result = session.set_model("gpt-4.1", None).await;
+    println!("set_model result: {:?}", result);
+    // Don't hard-fail if model not available, just verify the RPC works
+    assert!(
+        result.is_ok() || format!("{:?}", result).contains("model"),
+        "set_model should succeed or fail with model-related error"
+    );
+
+    client.stop().await;
+}
+
+#[tokio::test]
+async fn test_set_model_with_reasoning_effort() {
+    skip_if_no_cli!();
+
+    let client = create_test_client().await.expect("Failed to create client");
+
+    let auth = client.get_auth_status().await.expect("Failed to get auth");
+    if !auth.is_authenticated {
+        println!("Skipping test - not authenticated");
+        client.stop().await;
+        return;
+    }
+
+    let session = client
+        .create_session(byok_session_config())
+        .await
+        .expect("Failed to create session");
+
+    let result = session
+        .set_model(
+            "gpt-4.1",
+            Some(SetModelOptions {
+                reasoning_effort: Some("high".into()),
+            }),
+        )
+        .await;
+
+    println!("set_model with reasoning effort: {:?}", result);
+
+    client.stop().await;
+}
+
+// =============================================================================
+// Mode Management Tests
+// =============================================================================
+
+#[tokio::test]
+async fn test_get_mode() {
+    skip_if_no_cli!();
+
+    let client = create_test_client().await.expect("Failed to create client");
+
+    let session = client
+        .create_session(byok_session_config())
+        .await
+        .expect("Failed to create session");
+
+    let mode = session.get_mode().await.expect("Failed to get mode");
+    println!("Current mode: {:?}", mode);
+
+    client.stop().await;
+}
+
+#[tokio::test]
+async fn test_set_mode_to_plan() {
+    skip_if_no_cli!();
+
+    let client = create_test_client().await.expect("Failed to create client");
+
+    let session = client
+        .create_session(byok_session_config())
+        .await
+        .expect("Failed to create session");
+
+    session
+        .set_mode(SessionMode::Plan)
+        .await
+        .expect("Failed to set mode to plan");
+
+    let mode = session.get_mode().await.expect("Failed to get mode");
+    assert_eq!(mode, SessionMode::Plan, "Mode should be Plan");
+
+    client.stop().await;
+}
+
+#[tokio::test]
+async fn test_set_mode_roundtrip() {
+    skip_if_no_cli!();
+
+    let client = create_test_client().await.expect("Failed to create client");
+
+    let session = client
+        .create_session(byok_session_config())
+        .await
+        .expect("Failed to create session");
+
+    // Set to autopilot
+    session
+        .set_mode(SessionMode::Autopilot)
+        .await
+        .expect("Failed to set autopilot");
+
+    let mode = session.get_mode().await.expect("Failed to get mode");
+    assert_eq!(mode, SessionMode::Autopilot);
+
+    // Set back to interactive
+    session
+        .set_mode(SessionMode::Interactive)
+        .await
+        .expect("Failed to set interactive");
+
+    let mode = session.get_mode().await.expect("Failed to get mode");
+    assert_eq!(mode, SessionMode::Interactive);
+
+    client.stop().await;
+}
+
+// =============================================================================
+// Session Logging Tests
+// =============================================================================
+
+#[tokio::test]
+async fn test_session_log() {
+    skip_if_no_cli!();
+
+    let client = create_test_client().await.expect("Failed to create client");
+
+    let session = client
+        .create_session(byok_session_config())
+        .await
+        .expect("Failed to create session");
+
+    let result = session
+        .log("Test log entry", None)
+        .await
+        .expect("Failed to add log");
+
+    println!("Log event ID: {}", result.event_id);
+    assert!(!result.event_id.is_empty(), "Event ID should not be empty");
+
+    client.stop().await;
+}
+
+#[tokio::test]
+async fn test_session_log_with_options() {
+    skip_if_no_cli!();
+
+    let client = create_test_client().await.expect("Failed to create client");
+
+    let session = client
+        .create_session(byok_session_config())
+        .await
+        .expect("Failed to create session");
+
+    // Log with level and ephemeral flag
+    let result = session
+        .log(
+            "Ephemeral warning",
+            Some(LogOptions {
+                level: Some(SessionLogLevel::Warning),
+                ephemeral: Some(true),
+            }),
+        )
+        .await
+        .expect("Failed to add log with options");
+
+    println!("Log event ID (warning, ephemeral): {}", result.event_id);
+    assert!(!result.event_id.is_empty());
+
+    // Log an error-level entry
+    let result = session
+        .log(
+            "Error entry",
+            Some(LogOptions {
+                level: Some(SessionLogLevel::Error),
+                ephemeral: Some(false),
+            }),
+        )
+        .await
+        .expect("Failed to add error log");
+
+    println!("Log event ID (error): {}", result.event_id);
+    assert!(!result.event_id.is_empty());
+
+    client.stop().await;
+}
+
+// =============================================================================
+// Compaction Tests
+// =============================================================================
+
+#[tokio::test]
+async fn test_manual_compaction() {
+    skip_if_no_cli!();
+
+    let client = create_test_client().await.expect("Failed to create client");
+
+    let session = client
+        .create_session(SessionConfig {
+            infinite_sessions: Some(copilot_sdk::InfiniteSessionConfig::enabled()),
+            ..byok_session_config()
+        })
+        .await
+        .expect("Failed to create session");
+
+    // Compaction on an empty session may succeed or return a specific error
+    let result = session.compact().await;
+    println!("Compaction result: {:?}", result);
+    // We just verify the RPC doesn't crash - it may fail if there's nothing to compact
+
+    client.stop().await;
+}
+
+// =============================================================================
+// Tools List and Quota Tests
+// =============================================================================
+
+#[tokio::test]
+async fn test_tools_list() {
+    skip_if_no_cli!();
+
+    let client = create_test_client().await.expect("Failed to create client");
+
+    let result = client.tools_list(None).await.expect("Failed to list tools");
+
+    println!("Found {} tools", result.tools.len());
+    for tool in &result.tools {
+        println!("  - {} ({:?})", tool.name, tool.description);
+    }
+
+    // Should have at least some built-in tools
+    assert!(!result.tools.is_empty(), "Should have at least one tool");
+
+    client.stop().await;
+}
+
+#[tokio::test]
+async fn test_tools_list_with_model() {
+    skip_if_no_cli!();
+
+    let client = create_test_client().await.expect("Failed to create client");
+
+    let result = client
+        .tools_list(Some("gpt-4.1"))
+        .await
+        .expect("Failed to list tools for model");
+
+    println!("Found {} tools for gpt-4.1", result.tools.len());
+
+    client.stop().await;
+}
+
+#[tokio::test]
+async fn test_get_quota() {
+    skip_if_no_cli!();
+
+    let client = create_test_client().await.expect("Failed to create client");
+
+    let auth = client.get_auth_status().await.expect("Failed to get auth");
+    if !auth.is_authenticated {
+        println!("Skipping quota test - not authenticated");
+        client.stop().await;
+        return;
+    }
+
+    let result = client.get_quota().await;
+    println!("Quota result: {:?}", result);
+    // Quota may not be available for all account types, so don't hard-fail
+
+    client.stop().await;
 }
