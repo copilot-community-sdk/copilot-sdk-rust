@@ -556,9 +556,40 @@ pub struct SkillInvokedData {
 // Session Event (Discriminated Union)
 // =============================================================================
 
-/// Event data variants - the payload of each event type.
+/// Data for `external_tool.requested` event (protocol v3 broadcast model).
+///
+/// In protocol v3, tool calls are broadcast as session events instead of
+/// RPC requests. The SDK handles these internally and responds via
+/// `session.tools.handlePendingToolCall` RPC.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
+#[serde(rename_all = "camelCase")]
+pub struct ExternalToolRequestedData {
+    /// Unique request ID for correlating the response.
+    pub request_id: Option<String>,
+    /// Name of the tool being requested.
+    pub tool_name: Option<String>,
+    /// Tool call ID for tracking.
+    pub tool_call_id: Option<String>,
+    /// Arguments to pass to the tool handler.
+    pub arguments: Option<serde_json::Value>,
+}
+
+/// Data for `permission.requested` event (protocol v3 broadcast model).
+///
+/// In protocol v3, permission requests are broadcast as session events.
+/// The SDK handles these internally and responds via
+/// `session.permissions.handlePendingPermissionRequest` RPC.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PermissionRequestedData {
+    /// Unique request ID for correlating the response.
+    pub request_id: Option<String>,
+    /// The permission request details.
+    pub permission_request: Option<serde_json::Value>,
+}
+
+/// Event data variants - the payload of each event type.
+#[derive(Debug, Clone, Serialize)]
 pub enum SessionEventData {
     SessionStart(SessionStartData),
     SessionResume(SessionResumeData),
@@ -597,6 +628,10 @@ pub enum SessionEventData {
     SessionSnapshotRewind(SessionSnapshotRewindData),
     SessionUsageInfo(SessionUsageInfoData),
     SkillInvoked(SkillInvokedData),
+    /// External tool requested (protocol v3 broadcast).
+    ExternalToolRequested(ExternalToolRequestedData),
+    /// Permission requested (protocol v3 broadcast).
+    PermissionRequested(PermissionRequestedData),
     /// Unknown event - preserves raw JSON for forward compatibility.
     Unknown(serde_json::Value),
 }
@@ -847,6 +882,12 @@ fn parse_event_data(event_type: &str, data: serde_json::Value) -> SessionEventDa
         "skill.invoked" => serde_json::from_value(data)
             .map(SessionEventData::SkillInvoked)
             .unwrap_or_else(|_| SessionEventData::Unknown(serde_json::Value::Null)),
+        "external_tool.requested" => serde_json::from_value(data)
+            .map(SessionEventData::ExternalToolRequested)
+            .unwrap_or_else(|_| SessionEventData::Unknown(serde_json::Value::Null)),
+        "permission.requested" => serde_json::from_value(data)
+            .map(SessionEventData::PermissionRequested)
+            .unwrap_or_else(|_| SessionEventData::Unknown(serde_json::Value::Null)),
         // Unknown event type - preserve raw data
         _ => SessionEventData::Unknown(data),
     }
@@ -908,6 +949,67 @@ mod tests {
         let event = SessionEvent::from_json(&json).unwrap();
         assert!(event.is_session_idle());
         assert!(event.is_terminal());
+    }
+
+    #[test]
+    fn test_parse_external_tool_requested() {
+        let json = json!({
+            "id": "evt_125b",
+            "timestamp": "2024-01-15T10:30:02Z",
+            "type": "external_tool.requested",
+            "data": {
+                "requestId": "req_123",
+                "toolName": "echo",
+                "toolCallId": "call_456",
+                "arguments": {
+                    "text": "hello"
+                }
+            }
+        });
+
+        let event = SessionEvent::from_json(&json).unwrap();
+        match &event.data {
+            SessionEventData::ExternalToolRequested(data) => {
+                assert_eq!(data.request_id.as_deref(), Some("req_123"));
+                assert_eq!(data.tool_name.as_deref(), Some("echo"));
+                assert_eq!(data.tool_call_id.as_deref(), Some("call_456"));
+                assert_eq!(data.arguments.as_ref().unwrap()["text"], "hello");
+            }
+            other => panic!("Expected ExternalToolRequested, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_permission_requested() {
+        let json = json!({
+            "id": "evt_125c",
+            "timestamp": "2024-01-15T10:30:02Z",
+            "type": "permission.requested",
+            "data": {
+                "requestId": "req_789",
+                "permissionRequest": {
+                    "kind": "tool_execution",
+                    "toolCallId": "call_456",
+                    "toolName": "shell"
+                }
+            }
+        });
+
+        let event = SessionEvent::from_json(&json).unwrap();
+        match &event.data {
+            SessionEventData::PermissionRequested(data) => {
+                assert_eq!(data.request_id.as_deref(), Some("req_789"));
+                assert_eq!(
+                    data.permission_request.as_ref().unwrap()["kind"],
+                    "tool_execution"
+                );
+                assert_eq!(
+                    data.permission_request.as_ref().unwrap()["toolName"],
+                    "shell"
+                );
+            }
+            other => panic!("Expected PermissionRequested, got {other:?}"),
+        }
     }
 
     #[test]

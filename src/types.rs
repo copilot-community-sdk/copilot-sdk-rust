@@ -16,8 +16,13 @@ fn is_false(value: &bool) -> bool {
 // Protocol Version
 // =============================================================================
 
-/// SDK protocol version - must match copilot-agent-runtime server.
-pub const SDK_PROTOCOL_VERSION: u32 = 2;
+/// Maximum protocol version this SDK supports.
+/// This must match the version expected by the copilot-agent-runtime server.
+pub const SDK_PROTOCOL_VERSION: u32 = 3;
+
+/// Minimum protocol version this SDK can communicate with.
+/// Servers reporting a version below this are rejected.
+pub const MIN_PROTOCOL_VERSION: u32 = 2;
 
 // =============================================================================
 // Enums
@@ -544,7 +549,7 @@ impl Serialize for Tool {
         let mut state = serializer.serialize_struct("Tool", 3)?;
         state.serialize_field("name", &self.name)?;
         state.serialize_field("description", &self.description)?;
-        state.serialize_field("parametersSchema", &self.parameters_schema)?;
+        state.serialize_field("parameters", &self.parameters_schema)?;
         state.end()
     }
 }
@@ -1348,6 +1353,18 @@ mod tests {
 
         assert_eq!(tool.name, "my_tool");
         assert_eq!(tool.description, "A test tool");
+    }
+
+    #[test]
+    fn test_tool_serializes_parameters_field() {
+        let tool = Tool::new("my_tool")
+            .description("A test tool")
+            .schema(serde_json::json!({"type": "object"}));
+
+        let value = serde_json::to_value(&tool).unwrap();
+
+        assert_eq!(value["parameters"]["type"], "object");
+        assert!(value.get("parametersSchema").is_none());
     }
 
     #[test]

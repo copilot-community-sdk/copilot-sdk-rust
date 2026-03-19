@@ -30,8 +30,8 @@ pub enum CopilotError {
     },
 
     /// Protocol version mismatch
-    #[error("Protocol version mismatch: expected {expected}, got {actual}")]
-    ProtocolMismatch { expected: u32, actual: u32 },
+    #[error("Protocol version mismatch: SDK supports versions {min}-{max}, but server reports version {actual}. Please update your SDK or server to ensure compatibility.")]
+    ProtocolMismatch { min: u32, max: u32, actual: u32 },
 
     /// Protocol error (framing, invalid messages, etc.)
     #[error("Protocol error: {0}")]
@@ -138,12 +138,13 @@ mod tests {
     #[test]
     fn test_error_display() {
         let err = CopilotError::ProtocolMismatch {
-            expected: 1,
-            actual: 2,
+            min: 2,
+            max: 3,
+            actual: 1,
         };
         assert_eq!(
             err.to_string(),
-            "Protocol version mismatch: expected 1, got 2"
+            "Protocol version mismatch: SDK supports versions 2-3, but server reports version 1. Please update your SDK or server to ensure compatibility."
         );
     }
 
