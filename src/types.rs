@@ -8,6 +8,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::error::CopilotError;
+
 fn is_false(value: &bool) -> bool {
     !*value
 }
@@ -453,6 +455,8 @@ pub struct Tool {
     pub name: String,
     pub description: String,
     pub parameters_schema: serde_json::Value,
+    pub overrides_built_in_tool: bool,
+    pub skip_permission: bool,
     // Handler is stored separately in Session since it's not Clone-friendly
 }
 
@@ -463,6 +467,8 @@ impl Tool {
             name: name.into(),
             description: String::new(),
             parameters_schema: serde_json::json!({}),
+            overrides_built_in_tool: false,
+            skip_permission: false,
         }
     }
 
@@ -528,6 +534,18 @@ impl Tool {
         }
         self
     }
+
+    /// Mark this tool as overriding a built-in tool.
+    pub fn overrides_built_in_tool(mut self, value: bool) -> Self {
+        self.overrides_built_in_tool = value;
+        self
+    }
+
+    /// Skip permission checks for this tool.
+    pub fn skip_permission(mut self, value: bool) -> Self {
+        self.skip_permission = value;
+        self
+    }
 }
 
 impl std::fmt::Debug for Tool {
@@ -535,6 +553,8 @@ impl std::fmt::Debug for Tool {
         f.debug_struct("Tool")
             .field("name", &self.name)
             .field("description", &self.description)
+            .field("overrides_built_in_tool", &self.overrides_built_in_tool)
+            .field("skip_permission", &self.skip_permission)
             .finish()
     }
 }
@@ -546,10 +566,19 @@ impl Serialize for Tool {
         S: serde::Serializer,
     {
         use serde::ser::SerializeStruct;
-        let mut state = serializer.serialize_struct("Tool", 3)?;
+        let field_count = 3
+            + if self.overrides_built_in_tool { 1 } else { 0 }
+            + if self.skip_permission { 1 } else { 0 };
+        let mut state = serializer.serialize_struct("Tool", field_count)?;
         state.serialize_field("name", &self.name)?;
         state.serialize_field("description", &self.description)?;
         state.serialize_field("parameters", &self.parameters_schema)?;
+        if self.overrides_built_in_tool {
+            state.serialize_field("overridesBuiltInTool", &self.overrides_built_in_tool)?;
+        }
+        if self.skip_permission {
+            state.serialize_field("skipPermission", &self.skip_permission)?;
+        }
         state.end()
     }
 }
@@ -847,6 +876,14 @@ pub struct SessionConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub working_directory: Option<String>,
 
+    /// Client name identifier.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_name: Option<String>,
+
+    /// Agent to use for the session.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+
     /// Session hooks for pre/post tool use, session lifecycle, etc.
     #[serde(skip)]
     pub hooks: Option<SessionHooks>,
@@ -892,6 +929,14 @@ pub struct ResumeSessionConfig {
     /// Working directory for the session.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub working_directory: Option<String>,
+
+    /// Client name identifier.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_name: Option<String>,
+
+    /// Agent to use for the session.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
 
     /// If true, skip resuming and create a new session instead.
     #[serde(default, skip_serializing_if = "is_false")]
@@ -948,7 +993,6 @@ impl From<String> for MessageOptions {
 // =============================================================================
 
 /// Options for creating a CopilotClient.
-#[derive(Debug, Clone)]
 pub struct ClientOptions {
     pub cli_path: Option<PathBuf>,
     pub cli_args: Option<Vec<String>>,
@@ -991,6 +1035,23 @@ pub struct ClientOptions {
     /// This allows Copilot to use any tool without asking for approval.
     /// Use `deny_tools` in combination to create an allowlist with exceptions.
     pub allow_all_tools: bool,
+
+    /// OpenTelemetry configuration for tracing.
+    pub telemetry: Option<TelemetryConfig>,
+
+    /// Callback for custom model listing (BYOK).
+    #[allow(clippy::type_complexity)]
+    pub on_list_models: Option<
+        Arc<
+            dyn Fn() -> std::pin::Pin<
+                    Box<
+                        dyn std::future::Future<Output = Result<Vec<ModelInfo>, CopilotError>>
+                            + Send,
+                    >,
+                > + Send
+                + Sync,
+        >,
+    >,
 }
 
 impl Default for ClientOptions {
@@ -1011,6 +1072,59 @@ impl Default for ClientOptions {
             deny_tools: None,
             allow_tools: None,
             allow_all_tools: false,
+            telemetry: None,
+            on_list_models: None,
+        }
+    }
+}
+
+impl std::fmt::Debug for ClientOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClientOptions")
+            .field("cli_path", &self.cli_path)
+            .field("cli_args", &self.cli_args)
+            .field("cwd", &self.cwd)
+            .field("port", &self.port)
+            .field("use_stdio", &self.use_stdio)
+            .field("cli_url", &self.cli_url)
+            .field("log_level", &self.log_level)
+            .field("auto_start", &self.auto_start)
+            .field("auto_restart", &self.auto_restart)
+            .field("environment", &self.environment)
+            .field("github_token", &self.github_token)
+            .field("use_logged_in_user", &self.use_logged_in_user)
+            .field("deny_tools", &self.deny_tools)
+            .field("allow_tools", &self.allow_tools)
+            .field("allow_all_tools", &self.allow_all_tools)
+            .field("telemetry", &self.telemetry)
+            .field(
+                "on_list_models",
+                &self.on_list_models.as_ref().map(|_| "Fn(...)"),
+            )
+            .finish()
+    }
+}
+
+impl Clone for ClientOptions {
+    fn clone(&self) -> Self {
+        Self {
+            cli_path: self.cli_path.clone(),
+            cli_args: self.cli_args.clone(),
+            cwd: self.cwd.clone(),
+            port: self.port,
+            use_stdio: self.use_stdio,
+            cli_url: self.cli_url.clone(),
+            log_level: self.log_level,
+            auto_start: self.auto_start,
+            auto_restart: self.auto_restart,
+            environment: self.environment.clone(),
+            github_token: self.github_token.clone(),
+            use_logged_in_user: self.use_logged_in_user,
+            deny_tools: self.deny_tools.clone(),
+            allow_tools: self.allow_tools.clone(),
+            allow_all_tools: self.allow_all_tools,
+            telemetry: self.telemetry.clone(),
+            on_list_models: self.on_list_models.clone(),
         }
     }
 }
@@ -1276,6 +1390,215 @@ impl std::fmt::Display for StopError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.message)
     }
+}
+
+// =============================================================================
+// Session Mode
+// =============================================================================
+
+/// Session operation mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionMode {
+    Interactive,
+    Plan,
+    Autopilot,
+}
+
+// =============================================================================
+// Set Model Options
+// =============================================================================
+
+/// Options for switching models mid-session.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetModelOptions {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+}
+
+// =============================================================================
+// Session Log Types
+// =============================================================================
+
+/// Log level for session log entries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionLogLevel {
+    Error,
+    Info,
+    Warning,
+}
+
+/// Options for adding a log entry to a session.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LogOptions {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub level: Option<SessionLogLevel>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ephemeral: Option<bool>,
+}
+
+/// Result from adding a session log entry.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LogResult {
+    pub event_id: String,
+}
+
+// =============================================================================
+// Plan Data
+// =============================================================================
+
+/// Plan content data.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanData {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+}
+
+// =============================================================================
+// Agent Info
+// =============================================================================
+
+/// Information about an available agent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentInfo {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+// =============================================================================
+// Fleet Start Options
+// =============================================================================
+
+/// Options for starting a fleet of parallel agents.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FleetStartOptions {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+}
+
+// =============================================================================
+// Tools List Types
+// =============================================================================
+
+/// A tool definition as returned by the server.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolInfo {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub parameters: Option<serde_json::Value>,
+}
+
+/// Result from listing available tools.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolsListResult {
+    pub tools: Vec<ToolInfo>,
+}
+
+// =============================================================================
+// Quota Types
+// =============================================================================
+
+/// A snapshot of quota usage.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuotaSnapshot {
+    #[serde(rename = "type")]
+    pub quota_type: String,
+    #[serde(default)]
+    pub limit: Option<u64>,
+    #[serde(default)]
+    pub used: Option<u64>,
+    #[serde(default)]
+    pub remaining: Option<u64>,
+    #[serde(default)]
+    pub resets_at: Option<String>,
+}
+
+/// Result from getting account quota.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuotaResult {
+    pub quotas: Vec<QuotaSnapshot>,
+}
+
+// =============================================================================
+// Shell Exec Types
+// =============================================================================
+
+/// Signal to send to a shell process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ShellSignal {
+    SIGINT,
+    SIGKILL,
+    SIGTERM,
+}
+
+/// Options for executing a shell command.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShellExecOptions {
+    pub command: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub env: Option<HashMap<String, String>>,
+}
+
+/// Result from executing a shell command.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShellExecResult {
+    pub process_id: String,
+}
+
+// =============================================================================
+// Workspace File Types
+// =============================================================================
+
+/// Metadata about a workspace file.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceFile {
+    pub path: String,
+    #[serde(default)]
+    pub size: Option<u64>,
+    #[serde(default)]
+    pub modified_at: Option<String>,
+}
+
+// =============================================================================
+// Telemetry Config
+// =============================================================================
+
+/// OpenTelemetry configuration for the Copilot CLI process.
+#[derive(Debug, Clone, Default)]
+pub struct TelemetryConfig {
+    /// OTLP HTTP endpoint URL.
+    pub otlp_endpoint: Option<String>,
+    /// File path for JSON-lines trace output.
+    pub file_path: Option<String>,
+    /// Exporter type: "otlp-http" or "file".
+    pub exporter_type: Option<String>,
+    /// Instrumentation scope name.
+    pub source_name: Option<String>,
+    /// Whether to capture message content (prompts/responses).
+    pub capture_content: Option<bool>,
 }
 
 #[cfg(test)]
@@ -1616,5 +1939,175 @@ mod tests {
         let json = serde_json::to_value(&config).unwrap();
         // hooks field should be skipped from serialization
         assert!(json.get("hooks").is_none());
+    }
+
+    #[test]
+    fn test_session_mode_serialization() {
+        assert_eq!(
+            serde_json::to_string(&SessionMode::Interactive).unwrap(),
+            "\"interactive\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SessionMode::Plan).unwrap(),
+            "\"plan\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SessionMode::Autopilot).unwrap(),
+            "\"autopilot\""
+        );
+    }
+
+    #[test]
+    fn test_shell_signal_serialization() {
+        assert_eq!(
+            serde_json::to_string(&ShellSignal::SIGINT).unwrap(),
+            "\"SIGINT\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ShellSignal::SIGKILL).unwrap(),
+            "\"SIGKILL\""
+        );
+    }
+
+    #[test]
+    fn test_tool_overrides_fields() {
+        let tool = Tool::new("test")
+            .overrides_built_in_tool(true)
+            .skip_permission(true);
+        let value = serde_json::to_value(&tool).unwrap();
+        assert_eq!(value["overridesBuiltInTool"], true);
+        assert_eq!(value["skipPermission"], true);
+    }
+
+    #[test]
+    fn test_tool_overrides_fields_default() {
+        let tool = Tool::new("test");
+        let value = serde_json::to_value(&tool).unwrap();
+        // Should not serialize false values
+        assert!(value.get("overridesBuiltInTool").is_none());
+        assert!(value.get("skipPermission").is_none());
+    }
+
+    #[test]
+    fn test_session_config_new_fields() {
+        let config = SessionConfig {
+            client_name: Some("my-app".into()),
+            agent: Some("code-reviewer".into()),
+            ..Default::default()
+        };
+        let value = serde_json::to_value(&config).unwrap();
+        assert_eq!(value["clientName"], "my-app");
+        assert_eq!(value["agent"], "code-reviewer");
+    }
+
+    #[test]
+    fn test_log_options_serialization() {
+        let opts = LogOptions {
+            level: Some(SessionLogLevel::Warning),
+            ephemeral: Some(true),
+        };
+        let value = serde_json::to_value(&opts).unwrap();
+        assert_eq!(value["level"], "warning");
+        assert_eq!(value["ephemeral"], true);
+    }
+
+    #[test]
+    fn test_plan_data_serialization() {
+        let plan = PlanData {
+            content: Some("Step 1: Do things".into()),
+            title: Some("My Plan".into()),
+        };
+        let value = serde_json::to_value(&plan).unwrap();
+        assert_eq!(value["content"], "Step 1: Do things");
+        assert_eq!(value["title"], "My Plan");
+    }
+
+    #[test]
+    fn test_agent_info_deserialization() {
+        let json = serde_json::json!({
+            "name": "reviewer",
+            "displayName": "Code Reviewer",
+            "description": "Reviews code"
+        });
+        let agent: AgentInfo = serde_json::from_value(json).unwrap();
+        assert_eq!(agent.name, "reviewer");
+        assert_eq!(agent.display_name, Some("Code Reviewer".into()));
+    }
+
+    #[test]
+    fn test_telemetry_config_default() {
+        let config = TelemetryConfig::default();
+        assert!(config.otlp_endpoint.is_none());
+        assert!(config.file_path.is_none());
+        assert!(config.capture_content.is_none());
+    }
+
+    #[test]
+    fn test_set_model_options_serialization() {
+        let opts = SetModelOptions {
+            reasoning_effort: Some("high".into()),
+        };
+        let value = serde_json::to_value(&opts).unwrap();
+        assert_eq!(value["reasoningEffort"], "high");
+    }
+
+    #[test]
+    fn test_fleet_start_options_serialization() {
+        let opts = FleetStartOptions {
+            prompt: Some("Build and test the project".into()),
+        };
+        let value = serde_json::to_value(&opts).unwrap();
+        assert_eq!(value["prompt"], "Build and test the project");
+    }
+
+    #[test]
+    fn test_shell_exec_options_serialization() {
+        let opts = ShellExecOptions {
+            command: "ls -la".into(),
+            cwd: Some("/tmp".into()),
+            env: None,
+        };
+        let value = serde_json::to_value(&opts).unwrap();
+        assert_eq!(value["command"], "ls -la");
+        assert_eq!(value["cwd"], "/tmp");
+    }
+
+    #[test]
+    fn test_quota_snapshot_deserialization() {
+        let json = serde_json::json!({
+            "type": "premium_requests",
+            "limit": 1000,
+            "used": 42,
+            "remaining": 958,
+            "resetsAt": "2026-04-01T00:00:00Z"
+        });
+        let quota: QuotaSnapshot = serde_json::from_value(json).unwrap();
+        assert_eq!(quota.quota_type, "premium_requests");
+        assert_eq!(quota.limit, Some(1000));
+        assert_eq!(quota.used, Some(42));
+    }
+
+    #[test]
+    fn test_workspace_file_deserialization() {
+        let json = serde_json::json!({
+            "path": "plan.md",
+            "size": 1024,
+            "modifiedAt": "2026-03-19T12:00:00Z"
+        });
+        let file: WorkspaceFile = serde_json::from_value(json).unwrap();
+        assert_eq!(file.path, "plan.md");
+        assert_eq!(file.size, Some(1024));
+    }
+
+    #[test]
+    fn test_resume_session_config_new_fields() {
+        let config = ResumeSessionConfig {
+            client_name: Some("my-cli".into()),
+            agent: Some("helper".into()),
+            ..Default::default()
+        };
+        let value = serde_json::to_value(&config).unwrap();
+        assert_eq!(value["clientName"], "my-cli");
+        assert_eq!(value["agent"], "helper");
     }
 }

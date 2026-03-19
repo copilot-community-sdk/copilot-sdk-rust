@@ -53,9 +53,10 @@ pub use error::{CopilotError, Result};
 pub use types::{
     // Session lifecycle event type constants
     session_lifecycle_event_types,
+    // Config types
+    AgentInfo,
     // Enums
     AttachmentType,
-    // Config types
     AzureOptions,
     ClientOptions,
     ConnectionState,
@@ -64,12 +65,15 @@ pub use types::{
     ErrorOccurredHandler,
     ErrorOccurredHookInput,
     ErrorOccurredHookOutput,
+    FleetStartOptions,
     // Response types
     GetAuthStatusResponse,
     GetForegroundSessionResponse,
     GetStatusResponse,
     InfiniteSessionConfig,
     LogLevel,
+    LogOptions,
+    LogResult,
     McpLocalServerConfig,
     McpRemoteServerConfig,
     McpServerConfig,
@@ -85,6 +89,7 @@ pub use types::{
     PermissionRequest,
     PermissionRequestResult,
     PingResponse,
+    PlanData,
     PostToolUseHandler,
     PostToolUseHookInput,
     PostToolUseHookOutput,
@@ -92,6 +97,9 @@ pub use types::{
     PreToolUseHookInput,
     PreToolUseHookOutput,
     ProviderConfig,
+    // Quota types
+    QuotaResult,
+    QuotaSnapshot,
     ResumeSessionConfig,
     // Selection types
     SelectionAttachment,
@@ -105,20 +113,31 @@ pub use types::{
     // Session lifecycle types
     SessionLifecycleEvent,
     SessionLifecycleEventMetadata,
+    SessionLogLevel,
     SessionMetadata,
+    SessionMode,
     SessionStartHandler,
     SessionStartHookInput,
     SessionStartHookOutput,
     SetForegroundSessionResponse,
+    SetModelOptions,
+    // Shell types
+    ShellExecOptions,
+    ShellExecResult,
+    ShellSignal,
     StopError,
     SystemMessageConfig,
     SystemMessageMode,
+    // Telemetry types
+    TelemetryConfig,
     // Tool types
     Tool,
     ToolBinaryResult,
+    ToolInfo,
     ToolInvocation,
     ToolResult,
     ToolResultObject,
+    ToolsListResult,
     // User input types
     UserInputInvocation,
     UserInputRequest,
@@ -127,6 +146,8 @@ pub use types::{
     UserPromptSubmittedHandler,
     UserPromptSubmittedHookInput,
     UserPromptSubmittedHookOutput,
+    // Workspace types
+    WorkspaceFile,
     // Constants
     SDK_PROTOCOL_VERSION,
 };

@@ -79,6 +79,8 @@ pub fn define_tool(name: &str, description: &str, parameters_schema: Option<Valu
         name: name.to_string(),
         description: description.to_string(),
         parameters_schema: parameters_schema.unwrap_or(serde_json::json!({})),
+        overrides_built_in_tool: false,
+        skip_permission: false,
     }
 }
 
